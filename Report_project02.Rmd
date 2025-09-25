@@ -1,0 +1,1065 @@
+---
+title: "Modelling Peak Electricity Demand in Great Britain"
+author: Group 30, Matthew McCrea (s2157060), Tadhg Jones
+  (s2236397), Logan Hinkley (s2146776)
+output:
+  html_document:
+    number_sections: false
+  word_document: default
+  pdf_document:
+    number_sections: false
+header-includes:
+- \newcommand{\bm}[1]{\boldsymbol{#1}}
+- \newcommand{\mat}[1]{\begin{bmatrix}#1\end{bmatrix}}
+---
+Word Count: 2985
+```{r setup, include = FALSE}
+# Modify this setup code chunk to set options
+# or add extra packages etc if needed.
+# See the project instructions for more details
+# on what code to show, and where/how.
+
+# Set default code chunk options
+knitr::opts_chunk$set(
+  echo = FALSE,
+  eval = TRUE,
+  fig.width = 6,
+  fig.hight = 2.5
+)
+
+suppressPackageStartupMessages(library(tidyverse))
+theme_set(theme_bw())
+
+# To give the same random number sequence every time the document is knitted,
+# making it easier to discuss the specific numbers in the text:
+set.seed(12345L)
+```
+
+```{r code=readLines("code.R"), eval=FALSE, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+
+# Do not change this code chunk
+# Load function definitions
+source("code.R")
+```
+
+
+```{r packages, eval=TRUE, echo=FALSE, message=FALSE, warning=FALSE, results='hide'} 
+library(ggplot2)
+library(tidyverse)
+library(lubridate)
+library(zoo)
+library(knitr)
+library(dplyr)
+library(gridExtra)
+library(timeDate)
+library(Metrics)
+library(readr)
+library(broom)
+library(estimatr)
+library(sandwich)
+library(lmtest)
+library(kableExtra)
+library(rsample)
+
+```
+
+```{r data_setup, echo=FALSE, eval=TRUE, message=FALSE, warning=FALSE, results='hide'}
+demand_data <- read_csv("SCS_demand_modelling.csv")
+temp_hourly <- read_csv("SCS_hourly_temp.csv")
+demand_data$Date <- as.Date(demand_data$Date)
+demand_data$Month <- month(demand_data$Date, label = TRUE)
+demand_data$Year <- year(demand_data$Date)
+demand_data$Day <- day(demand_data$Date)
+
+
+```
+
+# Introduction
+
+In this report, we develop a linear regression model to generate realistic forecasts of peak daily electricity demand. Our goal is to provide NESO with a tool to better anticipate high-demand periods and avoid potential supply shortfalls. The analysis is based on historical demand and weather data such as temperature, wind and solar capacity throughout the winter period.
+
+We begin by identifying significant variables in the provided datasets, of hourly temperature data in `SCS_hourly_temp.csv` and other environmental and demand data `SCS_demand_modelling.csv` through visualisations and linear regressions. We also improve on NESO's choice temperature variable by creating our own temperature variable which has more exploratory power. 
+
+
+We conducted a series of statistical tests for heteroskedasticity (variance changes across the model) and autocorrelation to improve and refine our model for greater parsimony before comparing it to historic data and cross validation, using multiple methods across months and weekend/weekday splits. Robustness is further tested by simulating the model predictions across different years in the winter of 2013. We pay particular care in its accuracy for the top 5% of peak daily demand observations to ensure that future planning is less likely to create shortfalls. 
+
+Our model provided a marked increase in performance over the current specification used by NESO, where we found an increase in the adjusted $R^2$ and a decrease in the the RMSE highlighting that our model was better suited to the data. Our model was able to explain 93.60% of the variation in the data highlighting the strong fit as well as massively reducing the RMSE when predicting the top 5% of peak demand which is the area NESO are looking to investigate. But we also discovered limitations within the model for its long term prediction due to our model only considering historical data as well as not considering certain external factors outwith the dataset which need to be taken into consideration as well.
+
+
+
+# Data description and exploratory analysis
+We are provided with two datasets, (`SCS_demand_modelling.csv` ) and (`SCS_hourly_temp.csv` ). `SCS_demand_modelling.csv` includes demand and environmental data for the winter months (November to March) from $1991$ to $2014$. `SCS_hourly_temp.csv` contains the population weighted average hourly temperature for all dates in the same time period.
+
+### Do Solar or Wind Impact Demand?
+
+The variable Solar S represents the estimated capacity factor of solar generation based on solar outputs on the given date at 6pm, with installed solar generation as at 1 January 2015. It is reasonable to assume that there is a negative correlation between the solar levels and electricity demand as people use less heat and light when the sun is out. The wind variable is the estimated capacity of wind generation at 6pm on a given day based on windspeed and historic data. We plot both of these variables against demand and regress them in a univariate regression as a formal test of significance below. 
+
+```{r, echo=FALSE, eval=TRUE, message=FALSE, warning=FALSE, results='hide', fig.width = 9, fig.height = 3}
+library(patchwork)
+p_solar <- ggplot(demand_data, aes(x = solar_S, y = demand_gross)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "loess") +
+  labs(title = "Demand vs Solar", x = "Solar Capacity Factor", y = "Gross Demand (MW)") +
+  theme_minimal()
+
+p_wind <- ggplot(demand_data, aes(x = wind, y = demand_gross)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "loess") +
+  labs(title = "Demand vs Wind", x = "Wind Capacity Factor", y = "Gross Demand (MW)") +
+  theme_minimal()
+
+p_solar + p_wind
+```
+
+```{r}
+library(broom)
+library(knitr)
+
+model_solar <- lm(demand_gross ~ solar_S, data = demand_data)
+model_wind <- lm(demand_gross ~ wind, data = demand_data)
+
+solar_results <- tidy(model_solar) %>% mutate(Model = "Solar")
+wind_results <- tidy(model_wind) %>% mutate(Model = "Wind")
+regression_table <- bind_rows(solar_results, wind_results)
+
+kable(regression_table, digits = 4, caption = "Univariate Regression Results for Solar and Wind")
+```
+
+We find that Solar_S is statistically significant at the 1% level with a negative correlation. We will include it in our preliminary model as a result. The wind variable is not significant at the 10% level, and as such will not be included. 
+
+### How Demand Changes Over Time
+To understand how electricity demand evolves through time, we consider the variable DSN, which counts the number of days since November 1st. This provides a simple way to track time consistently across years.
+
+In the figure below on the left, we plot gross electricity demand against DSN, overlaying data from all years in our dataset. This visualisation shows a sharp drop in demand around the holiday period, consistent across years. This fall begins in late December and recovers shortly after the New Year.
+There are also systematic differences in demand between years, with each winter showing distinct demand levels.
+
+```{r time demand, echo = FALSE, fig.width = 9, fig.height = 4}
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(patchwork)
+
+demand_data_filtered <- demand_data[month(demand_data$Date) %in% c(11, 12, 1, 2, 3), ]
+demand_data_filtered$Month <- month(demand_data_filtered$Date, label = TRUE)
+demand_data_filtered$DayOfYear <- yday(demand_data_filtered$Date)
+
+demand_data_filtered$SeasonalDay <- ifelse(
+  month(demand_data_filtered$Date) >= 11, 
+  demand_data_filtered$DayOfYear - yday(as.Date(paste0(year(demand_data_filtered$Date), "-11-01")) - 1),
+  demand_data_filtered$DayOfYear + 61  
+)
+
+# plot day vs demand for all data and colour by year
+p1 <- ggplot(demand_data_filtered, aes(x = SeasonalDay, y = demand_gross, color = as.factor(start_year))) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  labs(
+    title = "Electricity Demand by Day of Year",
+    x = "Day of Year",
+    y = "Peak Demand (MW)",
+    color = "Year"
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 150, by = 15),
+    labels = function(x) format(as.Date("2021-11-01") + x, "%b %d")
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  )
+
+# define holiday days
+demand_data$Day <- format(demand_data$Date, "%d")
+demand_data$Month <- format(demand_data$Date, "%m")
+holiday_dates <- c("24-12", "25-12", "26-12", "31-12", "01-01", "02-01", "03-01", "04-01", "05-01", "06-01")
+demand_data$Holiday <- paste(demand_data$Day, demand_data$Month, sep = "-") %in% holiday_dates
+
+# box plot to see if holidays are different
+p2 <- ggplot(demand_data, aes(x = Holiday, y = demand_gross, fill = Holiday)) +
+  geom_boxplot() +
+  labs(
+    title = "Impact of Holidays on Demand",
+    x = "Holiday (TRUE/FALSE)",
+    y = "Gross Demand (MW)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    legend.position = "none"
+  )
+
+# Combine plots side by side
+p1 + p2
+
+```
+
+
+To isolate the holiday effect, we define a holiday window from December 23 to January 3 and exclude these dates from certain parts of our analysis. The above box plot of demand inside vs outside holidays reinforce this conclusion. Excluding these days helps prevent the temporary dip in demand from distorting our understanding of longer-term trends. As we are most concerned with avoiding shortfalls excluding these low demand days does not majorly inhibit our predictions in our use case. 
+Since temperature and demand change together over time, and the holiday period disrupts this trend, we explore whether each month has a distinct effect on demand beyond just temperature.
+
+Below we plot temperature against daily peak demand grouped by month as well as the year against peak daily demand. March differs most from the other months with a steeper decline in demand for temperatures above 0ºC, and we see a gradual increase in peak demand over the years until a peak around 2004 where we then start to see another decline.
+
+```{r temp_month, echo= FALSE, fig.width = 9, fig.height = 4, message=FALSE}
+# Plot 1
+p1 <- ggplot(demand_data, aes(x = temp, y = demand_gross, color = Month)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "loess") +
+  labs(title = "Demand vs Temperature by Month", x = "Temperature (°C)", y = "Gross Demand (MW)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    legend.position = "right"
+  )
+
+# Plot 2
+p2 <- ggplot(demand_data, aes(x = as.factor(Year), y = demand_gross)) +
+  geom_boxplot() +
+  labs(title = "Demand by Year", x = "Year", y = "Gross Demand (MW)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  ) 
+ 
+  
+
+# Combine side by side
+p1 + p2
+```
+
+This variation suggests the relationship between temperature and demand is not consistent across months. We will include interaction terms between month and temperature in our model to capture this effect. We can also see that the historic data from the year also impacts out data so we need to introduce a start year variable such that the model takes this into account.
+
+A possible explanation for March's deviation is seasonal behaviour as spring begins people may reduce heating use regardless of actual temperature.
+
+
+To account for the gradual changes over time and differences across years, we include DSN and its square to allow for nonlinear seasonal effects, the month of each observation and its interaction with temperature to further capture time variant effects, and a dummy for each year to capture larger changes due to population or climate change.
+
+### How does peak daily demand depend on temperature?
+To investigate the relationship between temperature and electricity demand, we plot average daily demand and temperature across all years. As shown in the figure below, both follow a seasonal pattern—temperature declines into mid-winter while demand rises, except for a sharp drop during the holiday period.
+
+```{r, echo=FALSE, eval=TRUE, message=FALSE, warning=FALSE, results='hide',fig.width = 5, fig.height = 3}
+
+avg_data <- demand_data %>%
+  mutate(day_month = format(Date, "%m-%d")) %>%
+  group_by(day_month, Month) %>%
+  summarize(
+    avg_demand = mean(demand_gross, na.rm = TRUE),
+    avg_temp = mean(temp, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(match(Month, c("Nov", "Dec", "Jan", "Feb", "Mar")), day_month)
+
+avg_data$plot_date <- as.Date(paste0("2020-", avg_data$day_month))
+avg_data$plot_date <- ifelse(
+  month(avg_data$plot_date) %in% c(11, 12),
+  as.Date(paste0("2019-", avg_data$day_month)),
+  avg_data$plot_date
+)
+avg_data$plot_date <- as.Date(avg_data$plot_date)
+temp_scaled <- (avg_data$avg_temp - max(avg_data$avg_temp)) * 
+  ((max(avg_data$avg_demand) - min(avg_data$avg_demand)) / 
+     (max(avg_data$avg_temp) - min(avg_data$avg_temp))) + max(avg_data$avg_demand)
+ggplot(avg_data, aes(x = plot_date)) +
+  geom_line(aes(y = avg_demand, color = "Demand Gross"), size = 0.7) +
+  geom_line(aes(y = temp_scaled, color = "Temperature"), size = 0.7) +
+  scale_y_continuous(
+    name = "Average Demand Gross (MW)",
+    sec.axis = sec_axis(
+      trans = ~ (. - max(avg_data$avg_demand)) * 
+        ((max(avg_data$avg_temp) - min(avg_data$avg_temp)) / 
+           (max(avg_data$avg_demand) - min(avg_data$avg_demand))) + max(avg_data$avg_temp),
+      name = "Average Temperature (°C)"
+    )
+  ) +
+  scale_x_date(date_labels = "%d %b", date_breaks = "2 weeks") +
+  labs(title = "Average Demand vs Temperature Across All Years", 
+       x = "Date",
+       y = "Average Electricity Demand (MW)") +
+  scale_color_manual(values = c("Demand Gross" = "blue", "Temperature" = "red")) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(size = 10)
+  )
+
+```
+
+As shown in above, both variables follow a seasonal pattern as temperature declines into mid-winter while demand rises, except for the holiday period.
+
+```{r, echo=FALSE, eval=TRUE, message=FALSE, warning=FALSE, results='asis',fig.width = 5, fig.height = 4}
+# Make sure temperature database date and times are nicely done
+temp_hourly <- temp_hourly %>%
+  mutate(datetime = dmy_hm(Date),     
+         date = as_date(datetime),    
+         hour = hour(datetime))       
+# construct the specification selected by our window tool
+temp_16 <- temp_hourly %>%
+  filter(hour == 16) %>%
+  select(date, temp) %>%
+  rename(temp_16 = temp)
+
+demand_data <- demand_data %>%
+  mutate(date = as_date(Date)) %>%  
+  left_join(temp_16, by = "date") %>%  
+  left_join(
+    temp_16 %>% 
+      rename(temp_16_prior = temp_16) %>% 
+      mutate(date = date + 1),      
+    by = "date"
+  )
+
+# Calculate the weighted average temperature (TA)
+demand_data <- demand_data %>%
+  mutate(TA = (0.4 * temp_16 + 0.6 * temp_16_prior) / 2)
+
+TA_model <- lm(demand_gross ~ TA, data = demand_data)
+
+
+
+TE_model   <- lm(demand_gross ~ TE, data = demand_data)
+TO_model   <- lm(demand_gross ~ TO, data = demand_data)
+temp_model <- lm(demand_gross ~ temp, data = demand_data)
+
+# put the table together
+model_tbl <- bind_rows(
+  tidy(TE_model) %>% filter(term == "TE") %>% mutate(Model = "TE"),
+  tidy(TO_model) %>% filter(term == "TO") %>% mutate(Model = "TO"),
+  tidy(temp_model) %>% filter(term == "temp") %>% mutate(Model = "Temp"),
+  tidy(TA_model) %>% filter(term == "TA") %>% mutate(Model = "TA")
+
+)
+
+# Add R^2
+model_tbl <- model_tbl %>%
+  mutate(R2 = c(summary(TE_model)$r.squared,
+                summary(TO_model)$r.squared,
+                summary(temp_model)$r.squared,
+                summary(TA_model)$r.squared)) %>%
+  select(Model, estimate, std.error, statistic, p.value, R2)
+
+kable(model_tbl, digits = 5, caption = "Comparison of Univariate Temperature Models")
+```
+
+To quantify this relationship, we regress the temperature metrics from the dataset of temp, TO, TE on peak daily demand. All yield large, significant negative coefficients (p < 0.01), supporting a strong inverse relationship between temperature and demand. Results are summarised in Table 1.
+
+To improve on NESO’s current metric (TE), we tested various temperature windows and combinations from day of and day before temperature using the hourly temperature data. After iterating over all combinations TA, a weighted average of today’s and yesterday’s 16:00 temperature readings (weights 0.4 and 0.6 respectively) performed best (see Table 1). This suggests that NESO’s current approach can be improved. As TA relies only on reliable hourly data, we adopt it as our temperature variable going forward.
+
+
+### Do days of the week matter?
+The weekday/weekends may exhibit different peak daily demands that must be accounted for due to working patterns. We plot the peak daily demand on each day of the week below.
+
+
+```{r, echo=FALSE, eval=TRUE, message=FALSE, warning=FALSE, results='hide', fig.width = 6, fig.height = 3}
+
+## Day of the week v Demand ----
+demand_data <- demand_data %>%
+  mutate(wdayindex = wday(date, label = FALSE))
+demand_data$wdayindex <- factor(
+  demand_data$wdayindex,
+  levels = c(1, 2, 3, 4, 5, 6, 7),
+  labels = c("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
+)
+ggplot(demand_data, aes(x = wdayindex, y = demand_gross)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "loess") +
+  labs(title = "Demand vs Day of the Week", x = "Day of the Week", y = "Gross Demand (MW)")
+
+```
+
+This figure displays a marked difference in the peak daily demand of weekdays and weekends with weekdays consistently higher than weekends. This is not a formal test but is compelling enough to include a weekday variable in our initial model.
+
+# Model Fitting
+
+The exploration of the data leads us to construct a model different from the current NESO model. We define our our model as the following
+$$
+D_t = \beta_0 +\beta_1 TA + \beta_2 Solar + \sum^{6}_{i=1} \gamma_i\ Weekday_i +  \beta_3\ Month + \sum^{2013}_{j=1992} \omega_j\ Start\ Year_j + \beta_4\ DSN \\
++ \beta _5\ DSN^2+\beta_6\ TA*Month +\epsilon, \quad \epsilon \sim N(0, \sigma^2)
+$$
+Where $D_t$ is the daily peak demand, $TA$ is the custom temperature variable, and $Solar$ is the solar capacity variable. The variables of $Weekday$, and $Start\ Year$ are dummies indicating their value. The baselines are Sunday and 1991 respectively. $Month$ is a discrete numerical variable ranging from 1 to 5 where November is 1 and March is 5 and the $TA*Month_k$ term is an interaction between the temperature and month, while $\epsilon$ represents the residuals of our model, assuming normal distribution. We examine residual plots for heteroscedasticity, autocorrelation, and normality below.
+
+
+```{r logan_data_cleaning, echo=FALSE, message = FALSE, fig.width = 9, fig.height = 5}
+demand_data <- read_csv("SCS_demand_modelling.csv")
+temp_hourly <- read_csv("SCS_hourly_temp.csv") 
+demand_data$Date <- as.Date(demand_data$Date)
+demand_data$Month <- month(demand_data$Date, label = TRUE)
+demand_data$Year <- year(demand_data$Date)
+demand_data$Day <- day(demand_data$Date)
+
+# Clean temp_hourly
+temp_hourly <- temp_hourly[-1, ]
+colnames(temp_hourly) <- c("timestamp", "temp")
+
+temp_hourly <- temp_hourly %>%
+mutate(
+  timestamp = parse_date_time(timestamp, orders = "dmy HM"),
+  date = as_date(timestamp),
+  hour = hour(timestamp),
+  temp = as.numeric(temp)
+)
+
+# Doing dates again (just in case)
+demand_data <- demand_data %>%
+mutate(
+  Date = as_date(Date),
+  date = Date)
+
+# Define holiday list
+holiday_dates <- c("23-12", "24-12", "25-12", "26-12", 
+                 "31-12", "01-01", "01-02", "01-03")
+
+# Mark holidays
+demand_data <- demand_data %>%
+mutate(
+  holiday_code = format(Date, "%d-%m"),
+  is_holiday = holiday_code %in% holiday_dates
+)
+
+# Exclude holidays
+demand_data <- demand_data %>% filter(!is_holiday)
+
+# Make temp variable TA
+temp_16 <- temp_hourly %>%
+filter(hour == 16) %>%
+select(date, temp) %>%
+rename(temp_16 = temp)
+demand_data <- demand_data %>%
+left_join(temp_16, by = "date") %>%
+left_join(
+  temp_16 %>%
+    rename(temp_16_prior = temp_16) %>%
+    mutate(date = date + 1),
+  by = "date"
+)
+
+demand_data <- demand_data %>%
+mutate(TA = (0.4 * temp_16 + 0.6 * temp_16_prior) / 2)
+
+# renumber months for linear relationship ease
+demand_data <- demand_data %>%
+mutate(
+  winter_month = case_when(
+    month(Date) == 11 ~ 1,  # November
+    month(Date) == 12 ~ 2,  # December
+    month(Date) == 1  ~ 3,  # January
+    month(Date) == 2  ~ 4,  # February
+    month(Date) == 3  ~ 5,  # March
+    TRUE ~ NA_integer_
+  )
+)
+
+# Create a grouping variable for month and weekday/weekend
+demand_data <- demand_data %>%
+mutate(
+  is_weekend = if_else(wday(Date) %in% c(1, 7), "Weekend", "Weekday"),
+  month = month(Date)
+)
+
+demand_data <- demand_data %>%
+arrange(Date) %>%
+mutate(lag_demand = lag(demand_gross, default = first(demand_gross)))
+
+
+```
+
+```{r, echo=FALSE,fig.width = 9, fig.height = 6}
+# Run first model iteration and plot residuals
+good_model <- lm(demand_gross ~ TA + solar_S+wind+
+                   as.factor(wdayindex)  + DSN + I(DSN^2) + winter_month+ TA:month(Date)+
+                   as.factor(start_year),
+                 data = demand_data)
+par(mfrow=c(2,2))
+
+plot(good_model)
+
+
+```
+
+The Residuals vs Fitted and Scale-Location plots may show increasing variance with higher predicted demand which biases standard errors. A Breusch-Pagan test for non homogeneous variance (heteroscedasticity) confirms this (BP = 238.57, df = 34, p < 0.0001). The Q-Q plot shows non-normality in the lower tail while no influential points are flagged via Cook’s Distance.
+
+We plot ACF and PACF to test for autocorrelation below. This checks if the residuals of a model are correlated. This can indicate persistence in shocks or signal ommitted variables which can bias standard errors: 
+
+
+```{r, echo=FALSE,fig.width = 6, fig.height = 4}
+#plot ACF
+residuals_model <- residuals(good_model)
+par(mfrow=c(1,2))
+
+acf(residuals_model, main = "ACF of residuals")
+pacf(residuals_model, main = "PACF of residuals")
+
+```
+
+The ACF/PACF plots reveal clear autocorrelation. This biases standard errors, risking spurious significance.
+
+To address this, we add a lag of peak demand which lag significantly reduces the autocorrelation, however, additional lags (up to 20) did not substantially improve the plot. We apply Newey–West robust standard errors which adjust the error for both heteroscedasticity and autocorrelation so that bias is removed. 
+
+We recalculate the confidence intervals for all coefficients using Newey–West robust standard errors according to the default lag specification in R. We aim to remove any only marginally significant variables for parsimony, the balance of predictive ability and simplicity in a model.
+The results show that Solar, the TA–Month interaction, and DSN are only marginally significant (p > 0.05), so we remove them.
+
+We specify the following model and plot its residuals and autocorrelation plots below:
+
+$$
+D_t = \beta_0 +\beta_1 TA + \sum^{6}_{i=1} \gamma_i\ Weekday_i +  \beta_2\ Month + \sum^{2013}_{j=1992} \omega_j\ Start\ Year_j +
++ \beta _3\ DSN^2 + \beta_4\ D_{t-1}+\epsilon, \quad \epsilon \sim N(0, \sigma^2)
+$$
+
+```{r final_model_plots, echo=FALSE,fig.width = 9, fig.height = 6}
+# plot residuals of new and improved formula!
+model_formula <-lm(demand_gross ~ TA+ lag_demand +  
+                                         as.factor(wdayindex) + I(DSN^2)+
+                                         as.factor(start_year) + month(date),
+                                       data = demand_data)
+par(mfrow=c(2,2))
+plot(model_formula)
+
+```
+
+```{r, echo=FALSE,fig.width = 6, fig.height = 4}
+
+good_model_with_lag <- lm(demand_gross ~ TA+ lag_demand +  
+                                         as.factor(wdayindex) + I(DSN^2)+
+                                         as.factor(start_year) + month(date),
+                                       data = demand_data)
+
+residuals_lag <- residuals(good_model_with_lag)
+par(mfrow=c(1,2))
+
+acf(residuals_lag, main = "ACF of residuals")
+pacf(residuals_lag, main = "PACF of residuals")
+
+
+```
+
+This updated model shows significantly reduced autocorrelation, though heteroscedasticity remains, with a Breusch-Pagan statistic of 177.28 on 35 degrees of freedom (p < 0.01). The Q-Q plot also reveals increased deviation from normality, now affecting the upper quartiles as well. Despite the violations of the OLS assumptions on heteroscedasticity, autocorrelation, and normal residuals our point forecases are unaffected and Newey–West robust standard errors account for heteroscedasticity and autocorrelation in standard errors. 
+
+We adopt this as our final model for forecasting peak daily demand.
+
+The coefficients for this estimation are below: 
+
+\newpage
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+model_formula <-lm(demand_gross ~ TA+ lag_demand +  
+                                         as.factor(wdayindex) + I(DSN^2)+
+                                         as.factor(start_year) + month(date),
+                                       data = demand_data)
+
+# Compute Newey-West robust standard errors and run the coefficient test
+nw_se <- NeweyWest(model_formula, prewhite = TRUE)
+nw_test <- coeftest(model_formula, vcov = nw_se)
+
+# Convert to a data frame
+coef_df <- as.data.frame.matrix(nw_test)
+coef_df <- rownames_to_column(coef_df, var = "Coefficient")
+
+# Define a function to map coefficient names to symbols (tempermental block don't touch again please)
+map_coef_latex <- function(name) {
+  if(name == "(Intercept)") return("$\\beta_0$")
+  if(name == "TA") return("$\\beta_1$")
+  if(name == "lag_demand") return("$\\beta_4$")
+  if(name == "I(DSN^2)") return("$\\beta_3$")
+  if(name == "month(date)") return("$\\beta_2$")
+  if(grepl("^as.factor\\(wdayindex\\)", name)) {
+    level <- sub("as.factor\\(wdayindex\\)", "", name)
+    if(level == "") level <- "1"
+    return(paste0("$\\gamma_{", level, "}$"))
+  }
+  if(grepl("^as.factor\\(start_year\\)", name)) {
+    year_val <- sub("as.factor\\(start_year\\)", "", name)
+    return(paste0("$\\omega_{", year_val, "}$"))
+  }
+  return(name)
+}
+
+coef_df$Greek <- sapply(coef_df$Coefficient, map_coef_latex)
+
+coef_df <- coef_df %>%
+  select(Greek, Estimate, `Std. Error`, `t value`, `Pr(>|t|)`)
+
+# Split the table into two parts
+n <- ceiling(nrow(coef_df) / 2)
+left <- coef_df[1:n, ]
+right <- coef_df[(n + 1):nrow(coef_df), ]
+
+# add a row of nothing so that they match length and show
+max_rows <- max(nrow(left), nrow(right))
+pad_rows <- function(df, total_rows) {
+  if (nrow(df) < total_rows) {
+    empty_row <- df[1, ]
+    empty_row[] <- NA
+    df <- bind_rows(df, empty_row[rep(1, total_rows - nrow(df)), ])
+  }
+  return(df)
+}
+
+left <- pad_rows(left, max_rows)
+right <- pad_rows(right, max_rows)
+
+combined_table <- bind_cols(left, right)
+
+# Render the table with smaller headers
+kable(combined_table, escape = FALSE,digits = 3, 
+      caption = "Model Estimates") %>%
+  kable_styling(font_size = 10) 
+```
+All parameters now included are significant with p-values < 1% with the exception of $\omega_{1992}$, $\omega_{1993}$.
+
+
+
+We compute the values of $R^2$, adjusted $R^2$, RMSE, RSE, and the RMSE for the top 5% of the demand to compare our model's fit to the data. These results are in the table below for the baseline and a new model:
+
+```{r historic_data, echo=FALSE}
+
+# All of our models
+m0 <- lm(demand_gross ~ wind + solar_S + temp + as.factor(wdayindex) + as.factor(monthindex), data = demand_data)
+
+good_model_with_lag <-lm(demand_gross ~ TA+ lag_demand +  
+                         as.factor(wdayindex) + I(DSN^2)+
+                         as.factor(start_year) + month(date),
+                       data = demand_data)
+
+
+#Compare R^2
+r_squared_m0 <- summary(m0)$r.squared #0.4655723
+r_squared_good_model_with_lag <- summary(good_model_with_lag)$r.squared #0.904098
+
+# Compare Residual standard error
+rse_m0 <- sqrt(sum(residuals(m0)^2) / (nrow(demand_data) - length(coef(m0)))) #3747.436
+rse_good_model_with_lag <- sqrt(sum(residuals(good_model_with_lag)^2) / (nrow(demand_data) - length(coef(good_model_with_lag)))) #1596.473
+
+#Compare adjusted R^2
+adj_r_squared_m0 <- summary(m0)$adj.r.squared #0.463567
+adj_r_squared_good_model_with_lag <- summary(good_model_with_lag)$adj.r.squared #0.902642
+
+# Compare RMSE
+rmse_m0 <- sqrt(mean(residuals(m0)^2, na.rm = TRUE)) #3739.888
+rmse_good_model_with_lag <- sqrt(mean(residuals(good_model_with_lag)^2, na.rm = TRUE)) #1038.251
+
+# Compute RMSE for top 5% of demand
+demand_data$pred_m0 <- predict(m0, newdata = demand_data)
+demand_data$pred_good_model_with_lag <- predict(good_model_with_lag, newdata = demand_data)
+top_5_percent <- quantile(demand_data$demand_gross, 0.95, na.rm = TRUE)
+top_5_percent_data <- demand_data %>%
+filter(demand_gross > top_5_percent)
+rmse_top_5_percent_m0 <- sqrt(mean((top_5_percent_data$demand_gross - top_5_percent_data$pred_m0)^2, na.rm = TRUE))
+rmse_top_5_percent_good_model_with_lag <- sqrt(mean((top_5_percent_data$demand_gross - top_5_percent_data$pred_good_model_with_lag)^2, na.rm = TRUE))
+
+# Make a table showing these values in a knitr kable
+comparison_table <- data.frame(
+Model = c("M0", "New Model"),
+R_squared = c(r_squared_m0, r_squared_good_model_with_lag),
+Adjusted_R_squared = c(adj_r_squared_m0, adj_r_squared_good_model_with_lag),
+RMSE = c(rmse_m0, rmse_good_model_with_lag),
+RSE = c(rse_m0, rse_good_model_with_lag),
+RMSE_Top_5_Percent = c(rmse_top_5_percent_m0, rmse_top_5_percent_good_model_with_lag)
+)
+kableExtra::kable(comparison_table, digits = 4, caption = "Model Comparison") %>%
+kable_styling(full_width = FALSE)
+```
+
+
+The $R^2$ value measures the proportion of variance in the dependent variable that is explained by the model, it is defined as:
+$$
+R^2 = 1 - \frac{\sum_{i=1}^{n}(y_i-\hat{y}_i)^2}{\sum_{i=1}^{n}(y_i-\bar{y})^2}
+$$
+where $n$ is the number of observations, $y_i$ is the actual value, $\hat{y}_i$ is the predicted value, and $\bar{y}$ is the mean of the actual values. An $R^2$ value of 1 implies a perfect model fit, while 0 means the model performs no better than the mean.
+
+The baseline model has an $R^2$ of 0.5461. The new model has an $R^2$ of 0.9360 suggesting a substantial improvement in model fit and variance explanation. This is not a foolproof metric for evaluating model quality so we also consider the adjusted $R^2$ which is adjusted for the number of predictors in the model. It is given by:
+$$
+R^2_{adj} = 1 - \frac{(1-R^2)(n-1)}{n-p-1}
+$$
+where $p$ is the number of predictors in the model. 
+The adjusted $R^2$ rises from 0.5443 in the baseline model to 0.9354 in the new model, confirming a meaningful improvement in fit after accounting for model complexity.
+
+We use RMSE to measure the average prediction error as it is in the same units as the variable and harshly punishes large errors and is given by:
+$$
+RMSE = \sqrt{\frac{1}{n}\sum_{i=1}^{n}(y_i-\hat{y}_i)^2}
+$$
+RMSE drops from 3334.04 MW in the baseline model to 1252.01 MW in the new model, indicating much more accurate predictions.
+
+The RSE or Residual Standard Error, is a measure of how far off the predictions are from the actual values, adjusted for the number of predictors in the model as below:
+$$
+RSE = \sqrt{\frac{1}{n-p}\sum_{i=1}^{n}(y_i-\hat{y}_i)^2}
+$$
+The RSE also improves, decreasing from 3341.14 MW to 1258.32 MW and again indicates improved power without overfitting.
+
+Motivated by our focus on helping forward planning avoid energy shortfalls we evaluate performance using RMSE for the top 5% of demand. This value drops from 4371.32 MW in the baseline to 823.66 MW in the new model and supports the hypothesis that we capture peak demand accurately. This error is less than 2% of the average peak daily demand which indicates that it is highly accurate. 
+
+### Cross Validation
+
+To assess the robustness of our model across different periods, we implement a cross-validation scheme that evaluates prediction accuracy separately for each month and for weekdays/weekends.
+
+For the monthly cross validation we use two methods. These are leave-one-month-out (LOMO) where an entire month is excluded from training and used for testing, and a random 80:20 split within each month, using 80% of the data for fitting and 20% for testing. We report RMSE to penalize large deviations and interval scores to assess predictive uncertainty. Results are presented in the table below.
+
+
+```{r combined_cv_results, echo=FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(lubridate)
+
+# For an 80% prediction interval
+alpha <- 0.2
+# making LOMO redefine months to make sure
+data_cv1 <- demand_data %>%
+  filter(!is_holiday, month(Date) %in% c(11, 12, 1, 2, 3)) %>%
+  mutate(monthindex = factor(case_when(
+    month(Date) == 11 ~ "Nov",
+    month(Date) == 12 ~ "Dec",
+    month(Date) == 1  ~ "Jan",
+    month(Date) == 2  ~ "Feb",
+    month(Date) == 3  ~ "Mar"
+  ), levels = c("Nov", "Dec", "Jan", "Feb", "Mar"))) %>%
+  arrange(Date)
+
+# Define model formula, follows from tutorial 7
+model_formula1 <- demand_gross ~ TA + lag_demand + wday(Date) + month(Date) +
+  I(DSN^2) + as.factor(start_year) + DSN
+
+rmse_vec1 <- numeric(length(levels(data_cv1$monthindex)))
+int_score_vec1 <- numeric(length(levels(data_cv1$monthindex)))
+
+for (mi in levels(data_cv1$monthindex)) {
+  train_set1 <- data_cv1 %>% 
+    filter(monthindex != mi) %>%
+    mutate(monthindex = factor(monthindex, levels = levels(data_cv1$monthindex)))
+  
+  test_set1 <- data_cv1 %>% 
+    filter(monthindex == mi) %>%
+    mutate(monthindex = factor(monthindex, levels = levels(data_cv1$monthindex)))
+  
+  if(nrow(test_set1) == 0) next
+  
+  fit1 <- lm(model_formula1, data = train_set1)
+  pred1 <- predict(fit1, newdata = test_set1, interval = "prediction", level = 0.8)
+  obs1 <- test_set1$demand_gross
+  
+  rmse_vec1[which(levels(data_cv1$monthindex) == mi)] <- sqrt(mean((obs1 - pred1[,"fit"])^2, na.rm = TRUE))
+  
+  int_score_vec1[which(levels(data_cv1$monthindex) == mi)] <- mean(
+    (pred1[,"upr"] - pred1[,"lwr"]) + (2/alpha) * (
+      ((pred1[,"lwr"] - obs1) * (obs1 < pred1[,"lwr"])) +
+      ((obs1 - pred1[,"upr"]) * (obs1 > pred1[,"upr"]))
+    ),
+    na.rm = TRUE
+  )
+}
+
+results_method1 <- tibble(
+  month = levels(data_cv1$monthindex),
+  'RMSE Score LOMO' = rmse_vec1,
+  'Interval Score LOMO' = int_score_vec1
+)
+
+# 80:20 split
+data_cv2 <- demand_data %>%
+  filter(!is_holiday, month(Date) %in% c(11, 12, 1, 2, 3)) %>%
+  mutate(winter_month = case_when(
+    month(Date) == 11 ~ "Nov",
+    month(Date) == 12 ~ "Dec",
+    month(Date) == 1  ~ "Jan",
+    month(Date) == 2  ~ "Feb",
+    month(Date) == 3  ~ "Mar",
+    TRUE ~ NA_character_
+  )) %>%
+  mutate(winter_month = factor(winter_month, levels = c("Nov", "Dec", "Jan", "Feb", "Mar"))) %>%
+  arrange(Date) %>%
+  mutate(lag_demand = lag(demand_gross, default = first(demand_gross)))
+
+# same model again
+model_formula2 <- demand_gross ~ TA + lag_demand + as.factor(wdayindex) + month(Date) +
+  I(DSN^2) + as.factor(start_year)
+
+rmse_vec2 <- numeric(length(levels(data_cv2$winter_month)))
+int_score_vec2 <- numeric(length(levels(data_cv2$winter_month)))
+
+for (mi in levels(data_cv2$winter_month)) {
+  train_set2 <- data_cv2 %>% 
+    filter(winter_month != mi) %>%
+    mutate(winter_month = factor(winter_month, levels = levels(data_cv2$winter_month)))
+  
+  test_set2 <- data_cv2 %>% 
+    filter(winter_month == mi) %>%
+    mutate(winter_month = factor(winter_month, levels = levels(data_cv2$winter_month)))
+  
+  if(nrow(test_set2) == 0) next
+  
+  fit2 <- lm(model_formula2, data = train_set2)
+  pred2 <- predict(fit2, newdata = test_set2, interval = "prediction", level = 0.8)
+  obs2 <- test_set2$demand_gross
+  
+  rmse_vec2[which(levels(data_cv2$winter_month) == mi)] <- sqrt(mean((obs2 - pred2[,"fit"])^2, na.rm = TRUE))
+  
+  int_score_vec2[which(levels(data_cv2$winter_month) == mi)] <- mean(
+    (pred2[,"upr"] - pred2[,"lwr"]) + (2/alpha) * (
+      ((pred2[,"lwr"] - obs2) * (obs2 < pred2[,"lwr"])) +
+      ((obs2 - pred2[,"upr"]) * (obs2 > pred2[,"upr"]))
+    ),
+    na.rm = TRUE
+  )
+}
+
+results_method2 <- tibble(
+  month = levels(data_cv2$winter_month),
+  'RMSE Score 80:20 Split' = rmse_vec2,
+  'Interval Score 80:20 Split' = int_score_vec2
+)
+
+# Combine the results from both methods by month
+combined_results <- left_join(results_method1, results_method2, by = "month")
+
+kable(combined_results,
+      digits = 2,
+      caption = "Comparison of Leave-One-Month-Out and 80:20 Cross-Validation Results by Month")
+```
+
+
+Model performance varies by month. February and March consistently show the lowest RMSE and interval scores, indicating reliable performance. December exhibits the highest error, likely due to residual holiday effects left over despite our exclusion of some days. Performance is notably worse under LOMO than 80:20 which is expected since predicting an unseen month is more difficult than sampling within known months.
+
+For weekdays vs weekends we perform an 80:20 cross-validation in each group. Training on only one group is highly innacurate due to their different baselines so we only use this method.
+The result of this scheme is below:
+
+
+```{r weekday_weekend_cv_results, message=FALSE, warning=FALSE, echo=FALSE}
+library(rsample)
+library(broom)
+library(dplyr)
+library(knitr)
+library(kableExtra)
+
+alpha <- 0.2  # 80% prediction interval
+
+# Ensure day type is defined
+demand_data <- demand_data %>%
+  mutate(
+    is_weekend = if_else(wday(Date) %in% c(1, 7), "Weekend", "Weekday"),
+    is_weekend = factor(is_weekend, levels = c("Weekday", "Weekend"))
+  )
+
+# CV by day type 
+cv_results_weekday <- demand_data %>%
+  group_by(is_weekend) %>%
+  group_modify(~ {
+    set.seed(123)
+    cv_folds <- vfold_cv(.x, v = 5)
+    
+    fold_results <- cv_folds %>%
+      mutate(
+        model = map(splits, ~ lm(model_formula, data = analysis(.x))),
+        preds = map2(model, splits, ~ suppressWarnings(
+          predict(.x, newdata = assessment(.y), interval = "prediction", level = 0.8)
+        )),
+        actuals = map(splits, ~ assessment(.x)$demand_gross),
+        
+        rmse = map2_dbl(preds, actuals, ~ sqrt(mean((.y - .x[,"fit"])^2, na.rm = TRUE))),
+        
+        interval_score = map2_dbl(preds, actuals, ~ mean(
+          (.x[,"upr"] - .x[,"lwr"]) + (2/alpha) * (
+            ((.x[,"lwr"] - .y) * (.y < .x[,"lwr"])) +
+            ((.y - .x[,"upr"]) * (.y > .x[,"upr"]))
+          ),
+          na.rm = TRUE
+        ))
+      )
+    
+    tibble(
+      avg_rmse = mean(fold_results$rmse),
+      avg_interval_score = mean(fold_results$interval_score)
+    )
+  }) %>%
+  ungroup()
+
+# Display results as a kable table
+kable(cv_results_weekday,
+      col.names = c("Day Type", "Average RMSE", "Average Interval Score"),
+      digits = 2,
+      caption = "Cross-Validation Results by Day Type (Weekday vs Weekend)") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed"))
+
+
+```
+Our results show weekend predictions to be more accurate, with lower RMSE and interval scores. Weekdays may show greater variability due to irregular work schedules, holidays which would not affect demand on the weekend, or time invariant demand in workplaces (offices, factories) which often have automated heating, cooling, and lighting systems which vary less with external factors and make prediction less accurate.
+
+
+Across all schemes, our model achieves strong predictive performance. No RMSE exceeds 7% of mean daily peak demand which is promising. However, high December errors require caution as they could reflect either holiday influenced low-demand days or missed high-demand events. Fortunately our prior reporting on the RMSE of the top 5% of observations supports the explanation that this is due to low demand days not high ones. 
+
+
+
+## How could the maximum annual demand have varied in the 2013-14 winter season if diﬀerent weather conditions had occurred?
+To evaluate how peak electricity demand during the 2013/14 winter might have changed under different weather conditions, we trained our model on historical data from years prior to 2013/14. We used this model to predict 2013/14 peak demand using weather data from earlier years (1991/92–2012/13) to observe the 2013/14 year effect, which was present under the full model.
+
+
+```{r simulated-peaks, echo=FALSE, message=FALSE, warning=FALSE, fig.width = 6, fig.height = 4}
+# Exclude 2013 winter from training (i.e. use data from 1991 to 2012)
+train_data <- demand_data %>%
+filter(year(Date) != 2013, month(Date) %in% c(11, 12, 1, 2, 3))
+
+# Fit the model on the training data
+model_excl_2013 <- lm(demand_gross ~ TA + lag_demand +  
+                      as.factor(wdayindex) + I(DSN^2) +
+                      as.factor(start_year) + month(date),
+                    data = train_data)
+
+## Get unique weather years from training data
+sim_years <- sort(unique(train_data$start_year))
+
+# store simulated peak predictions
+predictions <- tibble(WeatherYear = sim_years, PredictedPeak = NA_real_)
+
+# Loop over each weather year
+# For each weather year, compute the average TA and lag_demand for the winter period.
+for(i in seq_along(sim_years)) {
+yr <- sim_years[i]
+
+weather_yr <- demand_data %>% 
+  filter(year(Date) == yr, month(Date) %in% c(11,12,1,2,3))
+
+# Compute average values for TA and lag_demand from that winter
+avg_TA <- mean(weather_yr$TA, na.rm = TRUE)
+avg_lag <- mean(weather_yr$lag_demand, na.rm = TRUE)
+# For DSN, we can use the median value as it's in the middle
+med_DSN <- median(weather_yr$DSN, na.rm = TRUE)
+
+# Create a new data frame for prediction
+new_data <- tibble(
+  TA = avg_TA,
+  lag_demand = avg_lag,
+  wdayindex = 3, # we chose a workday to be baseline as they are higher
+  DSN = med_DSN,
+  start_year = 2013,  # target winter year effect
+  date = as.Date("2013-01-15")  
+)
+
+# Predict peak demand using the fitted model 
+pred <- predict(model_excl_2013, newdata = new_data)
+predictions$PredictedPeak[i] <- pred
+}
+
+# Obtain the actual peak demand for winter 2013/14 from the full data
+actual_2013_14 <- demand_data %>%
+filter((year(date) == 2013 & month(date) %in% c(11,12)) | 
+         (year(date) == 2014 & month(date) %in% c(1,2,3))) %>%
+pull(demand_gross) %>%
+max(na.rm = TRUE)
+
+# Identify the highest and lowest predicted peaks
+max_pred <- max(predictions$PredictedPeak, na.rm = TRUE)
+min_pred <- min(predictions$PredictedPeak, na.rm = TRUE)
+
+#plot the results
+ggplot(predictions, aes(x = WeatherYear, y = PredictedPeak)) +
+geom_line(size = 1) +
+geom_point(data = filter(predictions, PredictedPeak %in% c(max_pred, min_pred)),
+           aes(x = WeatherYear, y = PredictedPeak), color = "red", size = 3) +
+geom_hline(yintercept = actual_2013_14, linetype = "dashed", color = "blue", size = 1) +
+labs(
+  title = "Simulated 2013/14 Peak Electricity Demand Based on Historical Weather",
+  x = "Weather Year",
+  y = "Predicted Peak Demand (MW)",
+  caption = "Red dots denote highest and lowest simulated peaks; dashed line shows actual 2013 peak demand."
+) +
+theme_minimal() +
+theme(
+  plot.title = element_text(hjust = 0.5, size = 11, face = "bold"),
+  axis.text = element_text(size = 10)
+)
+
+peak_data <- data.frame(
+Type = c("Highest simulated peak", "Lowest simulated peak", "Actual peak (2013/14)"),
+Demand_MW = c(max_pred, min_pred, actual_2013_14)
+)
+
+kable(peak_data, 
+    col.names = c("Demand Type", "Value (MW)"),
+    digits = 0,  # Round to whole numbers
+    caption = "Simulated vs Actual Peak Electricity Demand (2013/14)") %>%
+kable_styling(bootstrap_options = c("striped", "hover"), 
+              full_width = FALSE,
+              position = "center") %>%
+row_spec(3, bold = TRUE, background = "#E8F4F8")  # Highlight the actual value
+
+```
+
+The plot shows substantial variation in predicted peak demand depending on the weather year. Red dots indicate the maximum and minimum simulated peaks, while the blue dashed line marks the actual 2013/14 peak of 52,453 MW.
+
+The highest simulated peak, 52,646 MW, occurred using 2010 weather, which had the lowest average temperature of 2.34°C which makes sense as more heating was required. The lowest simulated peak was 48,437 MW from 1992 which had a mild winter and high solar capacity which may have reduced demand.
+
+Below, we show the average temperature and solar capacity for each year. These match our prediction pattern with high demand in 1991, a dip in 1992, and by a steady rise until 2010. Our simulation also captures the post-2010 decline, consistent with actual demand trends.
+
+This result suggests our model effectively reflects the relationship between weather and peak demand and highlights the importance of stress-testing future demand scenarios under varying weather conditions, especially in the face of climate change. The difference between mild and severe winters spans over 4,000 MW or >10% of average demand which is vital for NESO’s planning.
+
+
+```{r weather_years, echo=FALSE, fig.width=12, fig.height=5}
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+# --- Average temperature plot ---
+avg_temp_year <- demand_data %>%
+group_by(year) %>%
+summarize(avg_temp = mean(temp, na.rm = TRUE), .groups = "drop")
+
+p1 <- ggplot(avg_temp_year, aes(x = factor(year), y = avg_temp)) +
+geom_bar(stat = "identity", fill = "steelblue") +
+geom_text(aes(label = round(avg_temp, 2)), vjust = -0.5, size = 3) +
+labs(
+  title = "Average Temperature per Year",
+  x = "Year",
+  y = "Average Temperature (°C)"
+) +
+theme_minimal() +
+theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+
+# --- Average solar plot ---
+avg_solar_year <- demand_data %>%
+group_by(year) %>%
+summarize(avg_solar = mean(solar_S, na.rm = TRUE), .groups = "drop")
+
+p2 <- ggplot(avg_solar_year, aes(x = factor(year), y = avg_solar)) +
+geom_bar(stat = "identity", fill = "steelblue") +
+geom_text(aes(label = round(avg_solar, 4)), vjust = -0.5, size = 3) +
+labs(
+  title = "Average Solar per Year",
+  x = "Year",
+  y = "Average Solar (MW)"
+) +
+theme_minimal() +
+theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+
+p1 + p2
+```
+
+
+
+
+# Limitations
+
+The model we created to predict peak electricity demand in Great Britain has some limitations. While it is accurate, several assumptions and exclusions may affect its reliability.
+
+The exclusion of holidays to better predict peak demand is the most striking limitation, especially as they are known to significantly alter demand. As observed, periods like Christmas and New Year show sharp deviations in usage and omitting these days could lead to inaccurate predictions.
+
+The model contains only time and weather variables. Further variables, such as economic growth, energy prices, demographics, and government regulations can have substantial impacts on demand but are not quantified here. Exogenous shocks due to geopolitical events or pandemics are inherently unpredictable and can drastically change usage patterns.
+
+Climate change introduces further uncertainty. As extreme weather becomes more frequent and domestic/industrial appliances adjust, historical weather-demand relationships may no longer hold. 
+
+The reliance on historical data presumes that past patterns will continue into the future, which may not be true due to the effects of global warming, technological advancements, or shifts in consumer behavior. The model's predictive performance may be compromised if future demand deviates significantly from historical trends.
+
+# Conclusion
+
+The final model we developed outperforms the standard model, $M_0$, in predicting peak electricity demand. Notable improvements were observed across various performance metrics including $R^2$, adjusted $R^2$, RMSE, RSE, and RMSE for the top 5% of demand. The selected model explains a significant portion of the variance in the data and is able to predict peak demand with a high degree of accuracy, making it useful for NESO's long-term planning goals.
+
+One of the key factors contributing to the model's success was the inclusion of lagged demand, which captured autocorrelation effects. This adjustment led to improved residuals and performance, as it better captured the true relationship between weather patterns and peak demand.
+
+It is important to note that the model then under performed in certain areas. The exclusion of holidays and using only weather-related factors could introduce bias, particularly when forecasting peak demand during holiday periods or across major economic/social changes. The model relies heavily on historical data, which may not accurately predict future demand and changes in behavior, such as rapid increases in electricity demand caused by government policy. While the inclusion of lagged demand improved predictive power, it also introduced challenges, such as further deviations from normality in the residuals. This was accounted for with Newey West standard errors but nonetheless limits our modelling.
+
+Despite these limitations, the model provides valuable insights for NESO's long-term planning. It allows NESO to make informed decisions about future energy demand, including investments in renewable energy sources and necessary infrastructure upgrades to model the very peak of demand, which this model is accurate at according to RMSE. However, NESO should remain cautious of the model's assumptions and the potential impact of external factors. Further investigation to provide electricity during the holiday period is required in order to avoid oversupply during that time.
+
+# Code Appendix
+
+Include here all the code used in your analysis. Ensure that the code is well-commented so it is easy to follow and reuse.
+
+```{r code=readLines("code.R"), eval=FALSE, echo=TRUE}
+# Do not change this code chunk
+```
